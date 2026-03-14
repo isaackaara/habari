@@ -4,7 +4,7 @@
   "description": "Multi-tenant AI email briefing via Telegram",
   "main": "src/app.js",
   "scripts": {
-    "start": "npx prisma migrate deploy && node src/app.js",
+    "start": "npx prisma db push --accept-data-loss && node src/app.js",
     "dev": "node --watch src/app.js",
     "db:migrate": "npx prisma migrate dev",
     "db:generate": "npx prisma generate",
