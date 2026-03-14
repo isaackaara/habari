@@ -1,51 +1,29 @@
-const { Queue, Worker } = require('bullmq');
-const { connection } = require('../lib/redis');
 const { prisma } = require('../lib/prisma');
 const { deliverBriefing } = require('./briefing');
 
-const briefingQueue = new Queue('briefings', { connection });
+// Simple in-process scheduler - no Redis/BullMQ needed
+// Checks every minute for clients whose briefing time matches, delivers directly.
 
 async function initScheduler() {
-  const worker = new Worker(
-    'briefings',
-    async (job) => {
-      const { clientId } = job.data;
-      console.log(`[scheduler] Processing briefing for client ${clientId}`);
-      await deliverBriefing(clientId);
-    },
-    {
-      connection,
-      concurrency: 5,
-    }
-  );
-
-  worker.on('completed', (job) => {
-    console.log(`[scheduler] Briefing job ${job.id} completed`);
-  });
-
-  worker.on('failed', (job, err) => {
-    console.error(`[scheduler] Briefing job ${job?.id} failed:`, err.message);
-  });
-
   scheduleCheckLoop();
-  console.log('[scheduler] Briefing scheduler initialized');
+  console.log('[scheduler] Briefing scheduler initialized (in-process)');
 }
 
 function scheduleCheckLoop() {
   setInterval(async () => {
     try {
-      await checkAndQueueBriefings();
+      await checkAndDeliverBriefings();
     } catch (err) {
       console.error('[scheduler] Check loop error:', err.message);
     }
   }, 60 * 1000);
 
-  checkAndQueueBriefings().catch((err) => {
+  checkAndDeliverBriefings().catch((err) => {
     console.error('[scheduler] Initial check error:', err.message);
   });
 }
 
-async function checkAndQueueBriefings() {
+async function checkAndDeliverBriefings() {
   const now = new Date();
   const currentTime = now.toLocaleTimeString('en-GB', {
     hour: '2-digit',
@@ -75,18 +53,13 @@ async function checkAndQueueBriefings() {
 
     if (existing) continue;
 
-    await briefingQueue.add(
-      `briefing-${client.id}`,
-      { clientId: client.id },
-      {
-        jobId: `${client.id}-${today}`,
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 60000 },
-      }
-    );
+    console.log(`[scheduler] Delivering briefing for ${client.name} (Telegram: ${client.telegramChatId})`);
 
-    console.log(`[scheduler] Queued briefing for ${client.name} (Telegram: ${client.telegramChatId})`);
+    // Deliver directly without BullMQ queue
+    deliverBriefing(client.id).catch((err) => {
+      console.error(`[scheduler] Briefing failed for ${client.id}:`, err.message);
+    });
   }
 }
 
-module.exports = { initScheduler, briefingQueue };
+module.exports = { initScheduler };
