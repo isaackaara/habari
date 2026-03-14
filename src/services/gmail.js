@@ -55,7 +55,7 @@ async function getAuthenticatedClient(clientRecord) {
     try {
       await prisma.client.update({
         where: { id: clientRecord.id },
-        data: { gmailTokens: merged },
+        data: { gmailTokens: JSON.stringify(merged) },
       });
     } catch (err) {
       console.error('[gmail] Failed to save refreshed tokens:', err.message);
