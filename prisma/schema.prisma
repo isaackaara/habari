@@ -1,0 +1,56 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// One tenant = one operator deployment (e.g. a company using Habari)
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  apiKey    String   @unique @default(uuid())
+  createdAt DateTime @default(now())
+  clients   Client[]
+}
+
+// One client = one end user talking to the bot
+model Client {
+  id             String     @id @default(uuid())
+  tenantId       String
+  tenant         Tenant     @relation(fields: [tenantId], references: [id])
+  name           String     @default("")
+
+  // Telegram identity
+  telegramChatId String?    @unique
+  telegramUsername String?
+
+  // Gmail OAuth tokens (stored as JSON: access_token, refresh_token, expiry_date, token_type, scope)
+  email          String?
+  gmailTokens    String?
+
+  // User preferences
+  topics         String?      // String[] e.g. ["Work", "Finance", "Travel"]
+  briefingTime   String     @default("07:00")
+  timezone       String     @default("Africa/Nairobi")
+
+  // State
+  onboardingStep String     @default("START")
+  isActive       Boolean    @default(false)
+  createdAt      DateTime   @default(now())
+
+  briefings      Briefing[]
+}
+
+model Briefing {
+  id          String    @id @default(uuid())
+  clientId    String
+  client      Client    @relation(fields: [clientId], references: [id])
+  date        String
+  emailCount  Int       @default(0)
+  content     String
+  deliveredAt DateTime?
+  createdAt   DateTime  @default(now())
+}

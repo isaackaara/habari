@@ -1,0 +1,27 @@
+{
+  "name": "habari",
+  "version": "2.0.0",
+  "description": "Multi-tenant AI email briefing via Telegram",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "npx prisma migrate deploy && node src/app.js",
+    "dev": "node --watch src/app.js",
+    "db:migrate": "npx prisma migrate dev",
+    "db:generate": "npx prisma generate",
+    "db:seed": "node prisma/seed.js",
+    "build": "npx prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "bullmq": "^5.0.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "googleapis": "^140.0.0",
+    "ioredis": "^5.0.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.0.0"
+  }
+}
