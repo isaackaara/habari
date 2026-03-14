@@ -89,7 +89,7 @@ router.get('/callback', async (req, res) => {
       updatedClient = await prisma.client.update({
         where: { id: clientId },
         data: {
-          gmailTokens: tokens,
+          gmailTokens: JSON.stringify(tokens),
           email: email || client.email,
         },
       });
