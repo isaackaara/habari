@@ -344,7 +344,7 @@ async function handleTopicsDone(chatId, callbackQueryId, client) {
   await prisma.client.update({
     where: { id: client.id },
     data: {
-      topics: finalTopics.length > 0 ? finalTopics : ['Work', 'Finance', 'Travel'],
+      topics: JSON.stringify(finalTopics.length > 0 ? finalTopics : ['Work', 'Finance', 'Travel']),
       onboardingStep: 'AWAITING_TIME',
     },
   });
@@ -431,7 +431,8 @@ async function handleStatusCommand(chatId, client) {
     return;
   }
 
-  const topics = Array.isArray(client.topics) ? client.topics.join(', ') : 'All topics';
+  const parsedTopics = typeof client.topics === 'string' ? (() => { try { return JSON.parse(client.topics); } catch { return []; } })() : (client.topics || []);
+  const topics = parsedTopics.length > 0 ? parsedTopics.join(', ') : 'All topics';
   const status = client.isActive ? '\u2705 Active' : '\u23F3 Pending setup';
 
   await bot.sendMessage(

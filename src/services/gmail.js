@@ -33,10 +33,19 @@ async function exchangeCode(code) {
 
 async function getAuthenticatedClient(clientRecord) {
   const oauth2 = createOAuth2Client();
-  const tokens = clientRecord.gmailTokens;
+  let tokens = clientRecord.gmailTokens;
 
   if (!tokens) {
     throw new Error('No Gmail tokens found for this client');
+  }
+
+  // gmailTokens is stored as a JSON string in the DB - parse it before use
+  if (typeof tokens === 'string') {
+    try {
+      tokens = JSON.parse(tokens);
+    } catch (parseErr) {
+      throw new Error('Gmail tokens are corrupted (invalid JSON). Please reconnect Gmail.');
+    }
   }
 
   oauth2.setCredentials(tokens);

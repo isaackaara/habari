@@ -95,7 +95,9 @@ function formatBriefing(emails, client) {
     month: 'long',
     year: 'numeric',
   });
-  const userTopics = Array.isArray(client.topics) ? client.topics : [];
+  const userTopics = typeof client.topics === 'string'
+    ? (() => { try { return JSON.parse(client.topics); } catch { return []; } })()
+    : (Array.isArray(client.topics) ? client.topics : []);
 
   const trimmed = emails.slice(0, MAX_EMAILS_IN_SUMMARY);
 
