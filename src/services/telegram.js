@@ -846,6 +846,7 @@ async function handleHelpCommand(chatId) {
       '/feedback - Tell us how to improve',
       '/start - Re-run setup',
       '/help - Show this message',
+      // /reset is admin-only (see ADMIN_CHAT_IDS in .env) - not shown here
     ].join('\n'),
     { parse_mode: 'Markdown' }
   );
@@ -1232,6 +1233,28 @@ function initTelegram() {
     handleFeedbackCommand(msg.chat.id, client).catch((e) =>
       console.error('[telegram] /feedback error:', e.message)
     );
+  });
+
+  // Admin-only: wipe user record and session for clean onboarding test
+  // Set ADMIN_CHAT_IDS in .env (comma-separated Telegram chat IDs)
+  bot.onText(/\/reset/, async (msg) => {
+    const chatId = msg.chat.id;
+    const adminIds = (process.env.ADMIN_CHAT_IDS || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(Number);
+
+    if (!adminIds.includes(chatId)) return; // silent fail for non-admins
+
+    try {
+      clearSession(chatId);
+      await prisma.client.deleteMany({ where: { telegramChatId: String(chatId) } });
+      await bot.sendMessage(chatId, 'Reset complete. Send /start to begin fresh.');
+    } catch (err) {
+      console.error('[/reset] Error:', err.message);
+      await bot.sendMessage(chatId, 'Reset failed: ' + err.message);
+    }
   });
 
   bot.on('message', (msg) =>
