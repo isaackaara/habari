@@ -35,6 +35,7 @@ model Client {
   topics         String?      // String[] e.g. ["Work", "Finance", "Travel"]
   briefingTime   String     @default("07:00")
   timezone       String     @default("Africa/Nairobi")
+  metadata       String?      // JSON string: onboarding context (topSenders, stressPoints, excludedTopics, feedbackHistory)
 
   // State
   onboardingStep String     @default("START")

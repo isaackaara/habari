@@ -33,7 +33,7 @@ async function generateBriefing(clientId) {
   const emails = await fetchRecentEmails(client);
   const today = new Date().toISOString().split('T')[0];
 
-  const content = formatBriefing(emails, client);
+  const content = await formatBriefing(emails, client);
 
   const briefing = await prisma.briefing.create({
     data: {

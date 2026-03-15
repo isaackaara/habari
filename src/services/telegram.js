@@ -3,19 +3,38 @@
  *
  * Handles the full user lifecycle via Telegram:
  *
- *   NEW ONBOARDING FLOW:
- *   /start  -> "Hi there, let me know your name"
- *   user sends name (extracted robustly) -> "Got it, [name]! Let's connect Gmail"
- *   [Gmail OAuth button shown]
- *   OAuth success -> fetch inbox, analyse topics, show % breakdown with checkboxes
- *   user selects topics -> "What time for your briefing?"
- *   user picks time -> all set, confirmed
+ *   ONBOARDING FLOW:
+ *   /start -> name -> Gmail OAuth -> inbox analysis (Haiku, batched) -> priority question
+ *          -> personalized follow-ups -> briefing time -> done
  *
- *   /briefing  -> on-demand briefing
+ *   Onboarding states:
+ *     AWAITING_NAME          - collecting user's name
+ *     AWAITING_GMAIL         - waiting for Gmail OAuth to complete
+ *     AWAITING_INBOX_PRIORITY - showing inbox analysis, waiting for Yes/No
+ *     AWAITING_PERSONALIZED_Q1 - personalized question 1 (compliance stress, urgent, etc.)
+ *     AWAITING_PERSONALIZED_Q2 - personalized question 2 (newsletters, etc.)
+ *     AWAITING_CONTEXT_1/2/3 - fallback generic questions (if analysis unavailable)
+ *     AWAITING_TIME          - picking briefing time
+ *     AWAITING_FEEDBACK      - collecting feedback text
+ *     COMPLETE               - fully onboarded
+ *
+ *   Inbox analysis (stored in Client.metadata.inboxProfile):
+ *     ONE Haiku call analyzing all 50 recent emails:
+ *     - category distribution (Client, Internal, Compliance, Financial, etc.)
+ *     - top 3 senders
+ *     - urgent email count
+ *     - compliance/newsletter flags
+ *     - skip suggestions
+ *
+ *   Commands:
+ *   /briefing  /summary -> on-demand briefing
  *   /status    -> account summary
+ *   /pause     -> pause briefings
+ *   /resume    -> resume briefings
+ *   /topics    -> update inbox context
+ *   /time      -> change briefing time
+ *   /feedback  -> submit feedback
  *   /help      -> command list
- *   /pause     -> pause daily briefings
- *   /resume    -> resume daily briefings
  */
 
 require('dotenv').config();
@@ -24,6 +43,7 @@ const { prisma } = require('../lib/prisma');
 const { getAuthUrl, fetchRecentEmails } = require('./gmail');
 const { generateBriefing } = require('./briefing');
 const { classifyEmail } = require('./briefingFormatter');
+const { analyzeInboxBatch } = require('../lib/ai');
 
 // ---------------------------------------------------------------------------
 // Bot singleton
@@ -31,18 +51,38 @@ const { classifyEmail } = require('./briefingFormatter');
 
 let bot = null;
 
-// In-memory session store: chatId -> { selectedTopics: Set<string>, discoveredTopics: {topic: pct}[] }
+// In-memory session store
+// chatId -> { selectedTopics: Set<string>, discoveredTopics: [], pendingContext: {} }
 const sessions = new Map();
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { selectedTopics: new Set(), discoveredTopics: [] });
+    sessions.set(chatId, { selectedTopics: new Set(), discoveredTopics: [], pendingContext: {} });
   }
   return sessions.get(chatId);
 }
 
 function clearSession(chatId) {
   sessions.delete(chatId);
+}
+
+// ---------------------------------------------------------------------------
+// Metadata helpers
+// ---------------------------------------------------------------------------
+
+function parseMetadata(client) {
+  if (!client.metadata) return {};
+  try { return JSON.parse(client.metadata); } catch { return {}; }
+}
+
+async function updateMetadata(clientId, patch) {
+  const client = await prisma.client.findUnique({ where: { id: clientId } });
+  const existing = client?.metadata ? (() => { try { return JSON.parse(client.metadata); } catch { return {}; } })() : {};
+  const merged = { ...existing, ...patch };
+  await prisma.client.update({
+    where: { id: clientId },
+    data: { metadata: JSON.stringify(merged) },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +262,152 @@ function buildBriefingButtons(briefingId) {
   };
 }
 
+function buildInboxPriorityKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '\u2705 Yes, prioritize', callback_data: 'inbox:priority:yes' },
+        { text: '\u27A1 Skip for now', callback_data: 'inbox:priority:no' },
+      ],
+    ],
+  };
+}
+
+function buildYesNoKeyboard(yesData, noData) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '\u2705 Yes', callback_data: yesData },
+        { text: '\u274C No', callback_data: noData },
+      ],
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Inbox analysis helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Format inbox analysis into a Telegram-ready summary message.
+ *
+ * Example output:
+ *   "Your inbox: 30% client (Alice, Bob), 20% KRA compliance, 15% internal, 35% other.
+ *    Should I prioritize *Client* emails first?"
+ *
+ * @param {object} analysis - result from analyzeInboxBatch
+ * @returns {{ text: string, topCategory: string }|null}
+ */
+function formatInboxAnalysisMessage(analysis) {
+  if (!analysis || !analysis.categories || !analysis.categories.length) return null;
+
+  const top4 = analysis.categories.slice(0, 4);
+  const catParts = top4.map((c) => {
+    const senders =
+      c.topSenders && c.topSenders.length > 0
+        ? ` (${c.topSenders.slice(0, 2).join(', ')})`
+        : '';
+    return `${c.pct}% ${c.name.toLowerCase()}${senders}`;
+  });
+
+  const topCat = top4[0]?.name || 'important';
+  const summary = catParts.join(', ');
+
+  const urgentNote =
+    analysis.urgentCount > 0 ? ` I also spotted *${analysis.urgentCount} urgent* email${analysis.urgentCount > 1 ? 's' : ''}.` : '';
+
+  const text = [
+    '\u{1F4E5} *Your inbox breakdown:*',
+    `${summary}.${urgentNote}`,
+    '',
+    `Should I prioritize *${topCat}* emails at the top of your briefings?`,
+  ].join('\n');
+
+  return { text, topCategory: topCat };
+}
+
+/**
+ * Generate the first personalized question based on inbox analysis.
+ * Returns { text, keyboard } or null.
+ */
+function generatePersonalizedQ1(profile) {
+  if (!profile) {
+    return {
+      text: [
+        'What types of emails stress you most?',
+        '',
+        '_For example: "overdue invoices, client complaints, KRA notices"_',
+        '',
+        "Type your answer or *none* to skip.",
+      ].join('\n'),
+      keyboard: null,
+    };
+  }
+
+  if (profile.hasCompliance) {
+    return {
+      text: '\u26A0\uFE0F I found *compliance/KRA* emails in your inbox. Do these stress you? I can flag them urgently.',
+      keyboard: buildYesNoKeyboard('personalized:compliance:yes', 'personalized:compliance:no'),
+    };
+  }
+
+  if (profile.urgentCount > 2) {
+    return {
+      text: `\u{1F6A8} I found *${profile.urgentCount} urgent emails*. Should I always flag urgent emails at the very top of your briefing?`,
+      keyboard: buildYesNoKeyboard('personalized:urgent:yes', 'personalized:urgent:no'),
+    };
+  }
+
+  const topCat = profile.categories && profile.categories[0];
+  if (topCat && topCat.pct > 30 && topCat.topSenders && topCat.topSenders.length > 0) {
+    const senderList = topCat.topSenders.slice(0, 2).join(' and ');
+    return {
+      text: `\u{1F4AC} *${senderList}* appear frequently in your inbox. Should I always show their emails first?`,
+      keyboard: buildYesNoKeyboard('personalized:topsenders:yes', 'personalized:topsenders:no'),
+    };
+  }
+
+  // Generic fallback
+  return {
+    text: [
+      'What types of emails stress you most?',
+      '',
+      '_For example: "overdue invoices, client complaints"_',
+      '',
+      "Type your answer or *none* to skip.",
+    ].join('\n'),
+    keyboard: null,
+  };
+}
+
+/**
+ * Generate the second personalized question (newsletters/skip).
+ * Returns { text, keyboard } or null if not needed.
+ */
+function generatePersonalizedQ2(profile) {
+  if (!profile || !profile.hasNewsletters) return null;
+  return {
+    text: '\u{1F4F0} I found newsletters and promotions in your inbox. Should I skip them in your daily briefing?',
+    keyboard: buildYesNoKeyboard('personalized:newsletters:yes', 'personalized:newsletters:no'),
+  };
+}
+
+/**
+ * Move to time selection after personalization is done.
+ */
+async function finalizePersonalizationAndAskTime(chatId, client) {
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_TIME' },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    '\u{1F44D} Got it. Your briefing is personalised.\n\nLast step: what time would you like your daily briefing?',
+    { reply_markup: buildTimesKeyboard() }
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Core handlers
 // ---------------------------------------------------------------------------
@@ -386,6 +572,200 @@ async function handleTimeSelect(chatId, time, callbackQueryId, client) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Context question handlers (onboarding steps 1-3)
+// ---------------------------------------------------------------------------
+
+async function handleContextQ1(chatId, text, client) {
+  // Store "topSenders"
+  const session = getSession(chatId);
+  session.pendingContext.topSenders = text.trim() || 'unspecified';
+
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_CONTEXT_2' },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    [
+      '*Question 2 of 3*',
+      '',
+      'What types of emails stress you? (e.g. "billing disputes, client complaints, overdue invoices")',
+      '',
+      '_I will flag these at the top with a warning so you can deal with them first._',
+    ].join('\n'),
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function handleContextQ2(chatId, text, client) {
+  const session = getSession(chatId);
+  session.pendingContext.stressPoints = text.trim() || 'unspecified';
+
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_CONTEXT_3' },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    [
+      '*Question 3 of 3*',
+      '',
+      'Any topics or senders you NEVER want in your briefing? (e.g. "newsletters, spam, promotions")',
+      '',
+      "_Type 'none' to skip._",
+    ].join('\n'),
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function handleContextQ3(chatId, text, client) {
+  const session = getSession(chatId);
+  session.pendingContext.excludedTopics = text.trim().toLowerCase();
+
+  // Save all context to metadata
+  await updateMetadata(client.id, session.pendingContext);
+
+  // Set default topics from context
+  const defaultTopics = ['Work', 'Finance', 'Travel'];
+  await prisma.client.update({
+    where: { id: client.id },
+    data: {
+      topics: JSON.stringify(defaultTopics),
+      onboardingStep: 'AWAITING_TIME',
+    },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    [
+      '\u{1F44D} Got it. Your briefing is personalised.',
+      '',
+      'Last step: what time would you like your daily briefing?',
+    ].join('\n'),
+    {
+      parse_mode: 'Markdown',
+      reply_markup: buildTimesKeyboard(),
+    }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Inbox analysis onboarding handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * User tapped "Yes, prioritize" after seeing inbox analysis.
+ * Store preference and ask personalized Q1.
+ */
+async function handleInboxPriorityYes(chatId, callbackQueryId, client) {
+  await bot.answerCallbackQuery(callbackQueryId, { text: 'Got it!' });
+
+  const metadata = parseMetadata(client);
+  const profile = metadata.inboxProfile;
+
+  await updateMetadata(client.id, { prioritizeTopCategory: true });
+
+  const q1 = generatePersonalizedQ1(profile);
+
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_PERSONALIZED_Q1' },
+  });
+
+  await bot.sendMessage(chatId, q1.text, {
+    parse_mode: 'Markdown',
+    ...(q1.keyboard ? { reply_markup: q1.keyboard } : {}),
+  });
+}
+
+/**
+ * User tapped "Skip for now" - skip personalization, go straight to time picker.
+ */
+async function handleInboxPriorityNo(chatId, callbackQueryId, client) {
+  await bot.answerCallbackQuery(callbackQueryId, { text: 'No problem!' });
+  await finalizePersonalizationAndAskTime(chatId, client);
+}
+
+/**
+ * Handle personalized callback buttons (compliance, urgent, topsenders, newsletters).
+ * Stores answers in metadata and advances to Q2 or time picker.
+ */
+async function handlePersonalizedCallback(chatId, data, callbackQueryId, client) {
+  await bot.answerCallbackQuery(callbackQueryId, { text: 'Saved!' });
+
+  const parts = data.split(':'); // personalized:type:answer
+  const type = parts[1];
+  const answer = parts[2];
+
+  const metaPatch = {};
+  if (type === 'compliance') metaPatch.complianceStress = answer === 'yes';
+  if (type === 'urgent') metaPatch.flagUrgent = answer === 'yes';
+  if (type === 'topsenders') metaPatch.prioritizeTopSenders = answer === 'yes';
+  if (type === 'newsletters') metaPatch.skipNewsletters = answer === 'yes';
+  await updateMetadata(client.id, metaPatch);
+
+  const metadata = parseMetadata(await prisma.client.findUnique({ where: { id: client.id } }));
+  const profile = metadata.inboxProfile;
+
+  // If Q1 was answered and newsletters haven't been asked yet, ask Q2
+  const isQ1Callback = ['compliance', 'urgent', 'topsenders'].includes(type);
+  if (isQ1Callback && profile?.hasNewsletters) {
+    const q2 = generatePersonalizedQ2(profile);
+    if (q2) {
+      await prisma.client.update({
+        where: { id: client.id },
+        data: { onboardingStep: 'AWAITING_PERSONALIZED_Q2' },
+      });
+      await bot.sendMessage(chatId, q2.text, {
+        parse_mode: 'Markdown',
+        reply_markup: q2.keyboard,
+      });
+      return;
+    }
+  }
+
+  await finalizePersonalizationAndAskTime(chatId, client);
+}
+
+/**
+ * Handle text response to personalized Q1 (free-text stress points).
+ */
+async function handlePersonalizedQ1Text(chatId, text, client) {
+  if (text.toLowerCase() !== 'none') {
+    await updateMetadata(client.id, { stressPoints: text.trim() });
+  }
+
+  const metadata = parseMetadata(await prisma.client.findUnique({ where: { id: client.id } }));
+  const profile = metadata.inboxProfile;
+  const q2 = generatePersonalizedQ2(profile);
+
+  if (q2) {
+    await prisma.client.update({
+      where: { id: client.id },
+      data: { onboardingStep: 'AWAITING_PERSONALIZED_Q2' },
+    });
+    await bot.sendMessage(chatId, q2.text, {
+      parse_mode: 'Markdown',
+      reply_markup: q2.keyboard,
+    });
+  } else {
+    await finalizePersonalizationAndAskTime(chatId, client);
+  }
+}
+
+/**
+ * Handle text response to personalized Q2 (free-text exclusions).
+ */
+async function handlePersonalizedQ2Text(chatId, text, client) {
+  if (text.toLowerCase() !== 'none') {
+    await updateMetadata(client.id, { excludedTopics: text.trim() });
+  }
+  await finalizePersonalizationAndAskTime(chatId, client);
+}
+
 async function handleGmailInfoQuery(callbackQueryId) {
   await bot.answerCallbackQuery(callbackQueryId, {
     text: 'Habari uses read-only Gmail access to summarise your emails. We never send emails or share your data.',
@@ -457,9 +837,13 @@ async function handleHelpCommand(chatId) {
       '*Habari Commands*',
       '',
       '/briefing - Get your email briefing now',
+      '/summary - Same as /briefing',
       '/status - View your account details',
+      '/topics - View or update inbox context',
+      '/time - Change your briefing time',
       '/pause - Pause daily briefings',
       '/resume - Resume daily briefings',
+      '/feedback - Tell us how to improve',
       '/start - Re-run setup',
       '/help - Show this message',
     ].join('\n'),
@@ -498,6 +882,126 @@ async function handleResumeCommand(chatId, client) {
 }
 
 // ---------------------------------------------------------------------------
+// New command handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * /topics - show current inbox context and offer to update it
+ */
+async function handleTopicsCommand(chatId, client) {
+  if (!client) {
+    await bot.sendMessage(chatId, 'No account found. Type /start to register.');
+    return;
+  }
+
+  const metadata = parseMetadata(client);
+  const lines = ['*Your Inbox Context*', ''];
+
+  if (metadata.topSenders) lines.push(`Top senders: ${metadata.topSenders}`);
+  if (metadata.stressPoints) lines.push(`Stress areas: ${metadata.stressPoints}`);
+  if (metadata.excludedTopics) lines.push(`Excluded: ${metadata.excludedTopics}`);
+
+  if (!metadata.topSenders && !metadata.stressPoints) {
+    lines.push("No context set yet. I'll ask a few questions to personalise your briefing.");
+  }
+
+  lines.push('');
+  lines.push('To update, reply with: /topics update');
+
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'Markdown' });
+}
+
+/**
+ * /topics update - restart context questions
+ */
+async function handleTopicsUpdate(chatId, client) {
+  if (!client) {
+    await bot.sendMessage(chatId, 'No account found. Type /start to register.');
+    return;
+  }
+
+  const session = getSession(chatId);
+  session.pendingContext = {};
+
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_CONTEXT_1' },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    [
+      "Let's update your inbox context.",
+      '',
+      '*Question 1 of 3*',
+      'Who emails you most? (e.g. "clients, my team, family")',
+    ].join('\n'),
+    { parse_mode: 'Markdown' }
+  );
+}
+
+/**
+ * /time - change briefing time
+ */
+async function handleTimeCommand(chatId, client) {
+  if (!client) {
+    await bot.sendMessage(chatId, 'No account found. Type /start to register.');
+    return;
+  }
+
+  await bot.sendMessage(
+    chatId,
+    `Current briefing time: *${client.briefingTime}*\n\nPick a new time:`,
+    { parse_mode: 'Markdown', reply_markup: buildTimesKeyboard() }
+  );
+}
+
+/**
+ * /feedback - collect user feedback
+ */
+async function handleFeedbackCommand(chatId, client) {
+  if (!client) {
+    await bot.sendMessage(chatId, 'No account found. Type /start to register.');
+    return;
+  }
+
+  await prisma.client.update({
+    where: { id: client.id },
+    data: { onboardingStep: 'AWAITING_FEEDBACK' },
+  });
+
+  await bot.sendMessage(
+    chatId,
+    [
+      'What would you like to improve about your briefings?',
+      '',
+      "Type your feedback and I'll log it. Or type 'cancel' to exit.",
+    ].join('\n')
+  );
+}
+
+async function handleFeedbackText(chatId, text, client) {
+  if (text.toLowerCase() === 'cancel') {
+    await prisma.client.update({ where: { id: client.id }, data: { onboardingStep: 'COMPLETE' } });
+    await bot.sendMessage(chatId, 'Feedback cancelled.');
+    return;
+  }
+
+  // Append feedback to metadata
+  const metadata = parseMetadata(client);
+  const history = metadata.feedbackHistory || [];
+  history.push({ date: new Date().toISOString().split('T')[0], text });
+  await updateMetadata(client.id, { feedbackHistory: history.slice(-10) }); // keep last 10
+
+  await prisma.client.update({ where: { id: client.id }, data: { onboardingStep: 'COMPLETE' } });
+
+  await bot.sendMessage(
+    chatId,
+    '\u{1F64F} Thanks for the feedback! It helps make Habari better.'
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Message router
 // ---------------------------------------------------------------------------
 
@@ -523,16 +1027,51 @@ async function routeMessage(msg) {
   }
 
   if (client.onboardingStep === 'AWAITING_GMAIL') {
-    // Nudge them to click the button
     await bot.sendMessage(
       chatId,
       [
         'Tap the button below to connect your Gmail.',
         '',
-        "Once connected I'll analyse your inbox and suggest topics for you.",
+        "Once connected I'll ask a few quick questions to personalise your briefing.",
       ].join('\n'),
       { reply_markup: buildGmailButton(client.id) }
     );
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_INBOX_PRIORITY') {
+    // User typed instead of tapping buttons
+    await bot.sendMessage(chatId, 'Please use the buttons above to answer. \u{1F447}');
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_PERSONALIZED_Q1') {
+    await handlePersonalizedQ1Text(chatId, text, client);
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_PERSONALIZED_Q2') {
+    await handlePersonalizedQ2Text(chatId, text, client);
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_CONTEXT_1') {
+    await handleContextQ1(chatId, text, client);
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_CONTEXT_2') {
+    await handleContextQ2(chatId, text, client);
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_CONTEXT_3') {
+    await handleContextQ3(chatId, text, client);
+    return;
+  }
+
+  if (client.onboardingStep === 'AWAITING_FEEDBACK') {
+    await handleFeedbackText(chatId, text, client);
     return;
   }
 
@@ -558,6 +1097,22 @@ async function routeCallbackQuery(query) {
   const client = await prisma.client.findUnique({
     where: { telegramChatId: String(chatId) },
   });
+
+  // Inbox analysis onboarding callbacks
+  if (data === 'inbox:priority:yes') {
+    await handleInboxPriorityYes(chatId, queryId, client);
+    return;
+  }
+
+  if (data === 'inbox:priority:no') {
+    await handleInboxPriorityNo(chatId, queryId, client);
+    return;
+  }
+
+  if (data.startsWith('personalized:')) {
+    await handlePersonalizedCallback(chatId, data, queryId, client);
+    return;
+  }
 
   if (data.startsWith('topic:')) {
     const topic = data.slice(6);
@@ -648,6 +1203,36 @@ function initTelegram() {
       console.error('[telegram] /resume error:', e.message)
     );
   });
+  bot.onText(/\/summary/, async (msg) => {
+    const client = await prisma.client.findUnique({ where: { telegramChatId: String(msg.chat.id) } });
+    handleBriefingCommand(msg.chat.id, client).catch((e) =>
+      console.error('[telegram] /summary error:', e.message)
+    );
+  });
+  bot.onText(/\/topics update/, async (msg) => {
+    const client = await prisma.client.findUnique({ where: { telegramChatId: String(msg.chat.id) } });
+    handleTopicsUpdate(msg.chat.id, client).catch((e) =>
+      console.error('[telegram] /topics update error:', e.message)
+    );
+  });
+  bot.onText(/\/topics$/, async (msg) => {
+    const client = await prisma.client.findUnique({ where: { telegramChatId: String(msg.chat.id) } });
+    handleTopicsCommand(msg.chat.id, client).catch((e) =>
+      console.error('[telegram] /topics error:', e.message)
+    );
+  });
+  bot.onText(/\/time/, async (msg) => {
+    const client = await prisma.client.findUnique({ where: { telegramChatId: String(msg.chat.id) } });
+    handleTimeCommand(msg.chat.id, client).catch((e) =>
+      console.error('[telegram] /time error:', e.message)
+    );
+  });
+  bot.onText(/\/feedback/, async (msg) => {
+    const client = await prisma.client.findUnique({ where: { telegramChatId: String(msg.chat.id) } });
+    handleFeedbackCommand(msg.chat.id, client).catch((e) =>
+      console.error('[telegram] /feedback error:', e.message)
+    );
+  });
 
   bot.on('message', (msg) =>
     routeMessage(msg).catch((e) => console.error('[telegram] message error:', e.message))
@@ -689,10 +1274,16 @@ async function sendBriefingToChat(chatId, content, briefingId) {
 /**
  * Called by the OAuth callback route after Gmail token exchange.
  *
- * New flow:
- *   1. Acknowledge Gmail connection
- *   2. Fetch inbox + analyse topics
- *   3. Show topic breakdown with checkboxes
+ * New inbox-analysis-first flow:
+ *   1. Show "Scanning your inbox..." message
+ *   2. Fetch 50 recent emails
+ *   3. Call Haiku ONCE (batched) to analyze all 50:
+ *      - Category distribution (Client, Internal, Compliance, Financial, etc.)
+ *      - Top 3 senders
+ *      - Urgent email count
+ *      - Compliance/newsletter flags
+ *   4. Present findings as formatted message with Yes/No inline buttons
+ *   5. If analysis fails, fall back to generic context questions
  *
  * @param {string} chatId
  * @param {object} clientRecord - fresh Prisma client record (has gmailTokens)
@@ -700,55 +1291,94 @@ async function sendBriefingToChat(chatId, content, briefingId) {
 async function notifyGmailConnected(chatId, clientRecord) {
   if (!bot) return;
 
+  let thinkingMsg = null;
   try {
-    await bot.sendMessage(chatId, '\u2705 Gmail connected! Analysing your inbox...');
+    thinkingMsg = await bot.sendMessage(chatId, '\u2705 Gmail connected! Scanning your inbox...');
 
-    // Fetch and analyse
-    let distribution = [];
-    try {
-      distribution = await analyzeInboxTopics(clientRecord);
-    } catch (err) {
-      console.error('[telegram] Inbox analysis error:', err.message);
+    // Attempt inbox analysis if AI is available
+    let analysis = null;
+    if (process.env.OPENROUTER_API_KEY) {
+      try {
+        console.log('[telegram] Fetching emails for inbox analysis...');
+        const emails = await fetchRecentEmails(clientRecord, 50);
+        console.log(`[telegram] Fetched ${emails.length} emails for analysis`);
+
+        if (emails.length > 0) {
+          console.log('[telegram] Running single Haiku call for inbox analysis...');
+          analysis = await analyzeInboxBatch(emails);
+          console.log('[telegram] Inbox analysis complete:', JSON.stringify(analysis, null, 2));
+        }
+      } catch (analysisErr) {
+        console.error('[telegram] Inbox analysis failed (will fall back):', analysisErr.message);
+      }
     }
 
-    // Store discovered topics in session
-    const session = getSession(chatId);
-    session.discoveredTopics = distribution;
-
-    // Pre-select top 3 topics
-    session.selectedTopics = new Set(distribution.slice(0, 3).map((d) => d.topic));
-
-    // Build the discovery message
-    let discoveryText;
-    if (distribution.length > 0) {
-      const topicList = distribution
-        .map((d) => `${d.topic} (${d.pct}%)`)
-        .join(', ');
-      discoveryText = [
-        `I found these topics in your inbox: *${topicList}*`,
-        '',
-        'Which matter most to you? Tap to toggle, then hit Done.',
-      ].join('\n');
-    } else {
-      discoveryText = [
-        "I couldn't find many emails yet. Pick the topics that matter to you and I'll watch for them.",
-        '',
-        'Tap to toggle, then hit Done.',
-      ].join('\n');
+    // Delete the "scanning..." message
+    if (thinkingMsg) {
+      await bot.deleteMessage(chatId, thinkingMsg.message_id).catch(() => {});
+      thinkingMsg = null;
     }
 
-    // Update onboarding step
+    if (analysis && analysis.categories && analysis.categories.length > 0) {
+      // Store inbox profile in metadata
+      await updateMetadata(clientRecord.id, { inboxProfile: analysis });
+
+      const formatted = formatInboxAnalysisMessage(analysis);
+
+      if (formatted) {
+        await prisma.client.update({
+          where: { id: clientRecord.id },
+          data: { onboardingStep: 'AWAITING_INBOX_PRIORITY' },
+        });
+
+        await bot.sendMessage(chatId, formatted.text, {
+          parse_mode: 'Markdown',
+          reply_markup: buildInboxPriorityKeyboard(),
+        });
+        return;
+      }
+    }
+
+    // Fallback: analysis unavailable or empty - use generic context questions
+    console.log('[telegram] Falling back to generic context questions');
     await prisma.client.update({
       where: { id: clientRecord.id },
-      data: { onboardingStep: 'AWAITING_TOPICS' },
+      data: { onboardingStep: 'AWAITING_CONTEXT_1' },
     });
 
-    await bot.sendMessage(chatId, discoveryText, {
-      parse_mode: 'Markdown',
-      reply_markup: buildTopicsKeyboard(session.selectedTopics, distribution),
-    });
+    await bot.sendMessage(
+      chatId,
+      '\u2705 Gmail connected! A few quick questions to personalise your briefings.'
+    );
+
+    await bot.sendMessage(
+      chatId,
+      [
+        '*Question 1 of 3*',
+        '',
+        'Who emails you most? (e.g. "clients, my team, family")',
+        '',
+        '_This helps me put the right emails at the top of your briefing._',
+      ].join('\n'),
+      { parse_mode: 'Markdown' }
+    );
   } catch (err) {
-    console.error('[telegram] Failed to send Gmail confirmation:', err.message);
+    console.error('[telegram] notifyGmailConnected error:', err.message);
+    // Clean up thinking message if still around
+    if (thinkingMsg) {
+      await bot.deleteMessage(chatId, thinkingMsg.message_id).catch(() => {});
+    }
+    // Attempt fallback to avoid user being stuck
+    try {
+      await prisma.client.update({
+        where: { id: clientRecord.id },
+        data: { onboardingStep: 'AWAITING_CONTEXT_1' },
+      });
+      await bot.sendMessage(chatId, '\u2705 Gmail connected! Tell me a bit about your inbox to personalise your briefing.');
+      await bot.sendMessage(chatId, '*Question 1 of 3*\n\nWho emails you most?', { parse_mode: 'Markdown' });
+    } catch (fallbackErr) {
+      console.error('[telegram] Fallback also failed:', fallbackErr.message);
+    }
   }
 }
 
@@ -759,4 +1389,6 @@ module.exports = {
   notifyGmailConnected,
   extractName,
   analyzeInboxTopics,
+  parseMetadata,
+  updateMetadata,
 };
